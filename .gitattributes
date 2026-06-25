@@ -1,0 +1,3 @@
+# VBA modules are imported by the Japanese Excel VBE as Shift-JIS (CP932)
+# with CRLF line endings. Keep them byte-for-byte; do not normalize.
+*.bas -text
