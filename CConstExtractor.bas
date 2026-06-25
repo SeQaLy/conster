@@ -14,12 +14,21 @@ Attribute VB_Name = "CConstExtractor"
 '  (展開後 列)、可能なら数値まで評価して(評価値 列)、どの定数を
 '  参照しているか(参照している定数 列)も並べて確認できる。
 '
-'  --- 使い方 -------------------------------------------------------
+'  --- 使い方 (一覧出力) -------------------------------------------
 '   1. Excel の VBE を開く (Alt+F11)
 '   2. [ファイル] > [ファイルのインポート] で本 .bas を取り込む
 '   3. ExtractCConstants を実行 (F5)
 '   4. [はい]=フォルダ選択(サブフォルダも再帰) / [いいえ]=ファイル個別選択
 '   5. C ファイルごとにシートを分けて出力 (シート名 = ファイル名)
+'
+'  --- 使い方 (まとめて検索) ---------------------------------------
+'   1. 作業中シートの A 列に、調べたい 定数 / 列挙体 の名前を縦に列挙
+'   2. その状態で LookupConstants を実行
+'   3. 解析データが未読込なら ExtractCConstants と同じ要領でソースを選択
+'      (一度 ExtractCConstants 済みなら再選択なしで即検索)
+'   4. 各行の B 列以降に
+'        種別 / 分類 / 値 / 展開後 / 評価値 / 配列要素数 / 参照 / ファイル / 行
+'      が書き込まれる。未定義の名前は B 列に "(該当なし)"。
 '
 '  --- 制限事項 -----------------------------------------------------
 '   * 関数形式マクロ  #define MAX(a,b) ...  は値を評価せず一覧化のみ。
@@ -53,24 +62,122 @@ Private mEvalOK As Boolean
 ' =====================================================================
 '  エントリポイント
 ' =====================================================================
+' C ソースを解析し、ファイル単位のシートに一覧出力する
 Public Sub ExtractCConstants()
+    If Not LoadSources() Then Exit Sub
+    OutputResults
+End Sub
+
+' 作業中シートの A 列に並んだ定数名を一括検索し、各行に値を出力する
+'   - A 列 : 検索したい 定数 / 列挙体 の名前 (1行1名)
+'   - B 列以降 : 解析結果を書き込む
+'  解析データが未読み込みなら、その場でソースを読み込む。
+Public Sub LookupConstants()
+    Dim ws As Worksheet: Set ws = ActiveSheet
+    If ws Is Nothing Then Exit Sub
+
+    ' 解析データが無ければ読み込む
+    If mRecords Is Nothing Then
+        If Not LoadSources() Then Exit Sub
+    ElseIf mRecords.Count = 0 Then
+        If Not LoadSources() Then Exit Sub
+    End If
+
+    ' 定数名 -> レコード の索引を作る (重複名は最初の定義を優先)
+    Dim idx As Object: Set idx = NewDict()
+    Dim rec As Variant
+    For Each rec In mRecords
+        Dim nm As String: nm = CStr(rec(F_NAME))
+        If Len(nm) > 0 Then
+            If Not idx.Exists(nm) Then idx.Add nm, rec
+        End If
+    Next rec
+
+    ' A 列の最終行
+    Dim lastRow As Long
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(-4162).Row   ' xlUp = -4162
+    If lastRow < 1 Then Exit Sub
+
+    ' 結果列の見出し (B 列以降)。検索キーは A 列にそのまま残す。
+    Dim heads As Variant
+    heads = Array("種別", "分類", "値", "展開後", "評価値", "配列要素数", "参照している定数", "ファイル", "行")
+
+    Application.ScreenUpdating = False
+    Dim foundN As Long, missN As Long
+    Dim r As Long
+    For r = 1 To lastRow
+        Dim key As String: key = Trim(CStr(ws.Cells(r, 1).Value))
+        ' 見出し行らしき "定数名" はスキップ
+        If Len(key) = 0 Or key = "定数名" Then
+            ' なにもしない
+        ElseIf idx.Exists(key) Then
+            Dim f As Variant: f = ComputeFields(idx(key))
+            ' f = (file,line,kind,category,name,value,resolved,eval,count,refs)
+            ws.Cells(r, 2).Value = f(2)    ' 種別
+            ws.Cells(r, 3).Value = f(3)    ' 分類
+            ws.Cells(r, 4).Value = f(5)    ' 値
+            ws.Cells(r, 5).Value = f(6)    ' 展開後
+            ws.Cells(r, 6).Value = f(7)    ' 評価値
+            ws.Cells(r, 7).Value = f(8)    ' 配列要素数
+            ws.Cells(r, 8).Value = f(9)    ' 参照している定数
+            ws.Cells(r, 9).Value = f(0)    ' ファイル
+            ws.Cells(r, 10).Value = f(1)   ' 行
+            foundN = foundN + 1
+        Else
+            ws.Cells(r, 2).Value = "(該当なし)"
+            ws.Range(ws.Cells(r, 3), ws.Cells(r, 10)).ClearContents
+            missN = missN + 1
+        End If
+    Next r
+
+    ' 見出し行を 1 行目の上に挿入 (A1 がデータなら退避)
+    PlaceLookupHeader ws, heads
+
+    ws.Columns.AutoFit
+    Application.ScreenUpdating = True
+
+    MsgBox "検索完了: ヒット " & foundN & " 件 / 該当なし " & missN & " 件", _
+           vbInformation, "CConstExtractor"
+End Sub
+
+' ルックアップ結果の見出しを 1 行目に用意する。
+' 既に A1 が見出し("定数名") ならその行へ、そうでなければ 1 行挿入して付ける。
+Private Sub PlaceLookupHeader(ws As Worksheet, heads As Variant)
+    Dim hasHeader As Boolean
+    hasHeader = (Trim(CStr(ws.Cells(1, 1).Value)) = "定数名")
+    If Not hasHeader Then
+        ws.Rows(1).Insert
+        ws.Cells(1, 1).Value = "定数名"
+    End If
+    Dim c As Long
+    For c = 0 To UBound(heads)
+        ws.Cells(1, c + 2).Value = heads(c)
+    Next c
+    ws.Range(ws.Cells(1, 1), ws.Cells(1, UBound(heads) + 2)).Font.Bold = True
+End Sub
+
+' 入力方法を選んでソースを読み込み mRecords / mMap を構築する。
+' 中断・対象なしなら False。
+Private Function LoadSources() As Boolean
+    LoadSources = False
+
     ' 入力方法を選択 (はい=フォルダ / いいえ=ファイル個別選択)
     Dim ans As VbMsgBoxResult
     ans = MsgBox("フォルダ内の C ソースをまとめて解析しますか?" & vbCrLf & _
                  "[はい] = フォルダを選択 (サブフォルダも再帰的に対象)" & vbCrLf & _
                  "[いいえ] = ファイルを個別に選択", _
                  vbYesNoCancel + vbQuestion, "CConstExtractor")
-    If ans = vbCancel Then Exit Sub
+    If ans = vbCancel Then Exit Function
 
     ' 解析対象パスを集める
     Dim paths As Collection: Set paths = New Collection
     If ans = vbYes Then
         Dim folder As String: folder = PickFolder()
-        If Len(folder) = 0 Then Exit Sub
+        If Len(folder) = 0 Then Exit Function
         Set paths = CollectFiles(folder)
         If paths.Count = 0 Then
             MsgBox "指定フォルダに .c/.h/.cpp/.hpp などが見つかりませんでした。", vbExclamation, "CConstExtractor"
-            Exit Sub
+            Exit Function
         End If
     Else
         Dim files As Variant
@@ -78,7 +185,7 @@ Public Sub ExtractCConstants()
             "C source (*.c;*.h;*.cpp;*.hpp),*.c;*.h;*.cpp;*.hpp,All files (*.*),*.*", _
             , "解析する C ソースを選択してください", , True)
         If VarType(files) = vbBoolean Then
-            If files = False Then Exit Sub   ' キャンセル
+            If files = False Then Exit Function   ' キャンセル
         End If
         If IsArray(files) Then
             Dim t As Long
@@ -117,8 +224,8 @@ Public Sub ExtractCConstants()
         ParseConsts CStr(it(1)), CStr(it(0))
     Next it
 
-    OutputResults
-End Sub
+    LoadSources = True
+End Function
 
 
 ' フォルダ選択ダイアログ (キャンセル時は "")
@@ -664,6 +771,17 @@ Private Sub WriteHeader(ws As Worksheet)
 End Sub
 
 Private Sub WriteRecord(ws As Worksheet, row As Long, rec As Variant)
+    Dim f As Variant: f = ComputeFields(rec)
+    Dim c As Long
+    For c = 0 To UBound(f)
+        ws.Cells(row, c + 1).Value = f(c)
+    Next c
+End Sub
+
+' 1 レコードから表示用フィールドを計算して配列で返す。
+' 戻り値: (0)ファイル (1)行 (2)種別 (3)分類 (4)定数名 (5)値
+'         (6)展開後 (7)評価値 (8)配列要素数 (9)参照している定数
+Private Function ComputeFields(rec As Variant) As Variant
     Dim raw As String, brk As String, ini As String
     raw = CStr(rec(F_RAW)): brk = CStr(rec(F_BRK)): ini = CStr(rec(F_INIT))
 
@@ -690,17 +808,11 @@ Private Sub WriteRecord(ws As Worksheet, row As Long, rec As Variant)
     Dim refs As String
     refs = BuildRefs(raw & " " & brk & " " & ini)
 
-    ws.Cells(row, 1).Value = BaseName(CStr(rec(F_FILE)))
-    ws.Cells(row, 2).Value = rec(F_LINE)
-    ws.Cells(row, 3).Value = rec(F_KIND)
-    ws.Cells(row, 4).Value = Category(CStr(rec(F_KIND)))
-    ws.Cells(row, 5).Value = rec(F_NAME)
-    ws.Cells(row, 6).Value = valueDisp
-    ws.Cells(row, 7).Value = resolved
-    ws.Cells(row, 8).Value = evalS
-    ws.Cells(row, 9).Value = cnt
-    ws.Cells(row, 10).Value = refs
-End Sub
+    ComputeFields = Array( _
+        BaseName(CStr(rec(F_FILE))), rec(F_LINE), CStr(rec(F_KIND)), _
+        Category(CStr(rec(F_KIND))), CStr(rec(F_NAME)), valueDisp, _
+        resolved, evalS, cnt, refs)
+End Function
 
 ' シート名に使えない文字を除去し 31 文字以内に収める
 Private Function SafeSheetName(nm As String) As String
