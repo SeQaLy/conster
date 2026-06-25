@@ -18,8 +18,8 @@ Attribute VB_Name = "CConstExtractor"
 '   1. Excel の VBE を開く (Alt+F11)
 '   2. [ファイル] > [ファイルのインポート] で本 .bas を取り込む
 '   3. ExtractCConstants を実行 (F5)
-'   4. ファイル選択ダイアログで .c / .h を選択 (複数選択可)
-'   5. アクティブブックに "C_Constants" シートを作成して出力
+'   4. [はい]=フォルダ選択(サブフォルダも再帰) / [いいえ]=ファイル個別選択
+'   5. C ファイルごとにシートを分けて出力 (シート名 = ファイル名)
 '
 '  --- 制限事項 -----------------------------------------------------
 '   * 関数形式マクロ  #define MAX(a,b) ...  は値を評価せず一覧化のみ。
@@ -54,39 +54,53 @@ Private mEvalOK As Boolean
 '  エントリポイント
 ' =====================================================================
 Public Sub ExtractCConstants()
-    Dim files As Variant
-    files = Application.GetOpenFilename( _
-        "C source (*.c;*.h;*.cpp;*.hpp),*.c;*.h;*.cpp;*.hpp,All files (*.*),*.*", _
-        , "解析する C ソースを選択してください", , True)
+    ' 入力方法を選択 (はい=フォルダ / いいえ=ファイル個別選択)
+    Dim ans As VbMsgBoxResult
+    ans = MsgBox("フォルダ内の C ソースをまとめて解析しますか?" & vbCrLf & _
+                 "[はい] = フォルダを選択 (サブフォルダも再帰的に対象)" & vbCrLf & _
+                 "[いいえ] = ファイルを個別に選択", _
+                 vbYesNoCancel + vbQuestion, "CConstExtractor")
+    If ans = vbCancel Then Exit Sub
 
-    If VarType(files) = vbBoolean Then
-        If files = False Then Exit Sub   ' キャンセル
+    ' 解析対象パスを集める
+    Dim paths As Collection: Set paths = New Collection
+    If ans = vbYes Then
+        Dim folder As String: folder = PickFolder()
+        If Len(folder) = 0 Then Exit Sub
+        Set paths = CollectFiles(folder)
+        If paths.Count = 0 Then
+            MsgBox "指定フォルダに .c/.h/.cpp/.hpp などが見つかりませんでした。", vbExclamation, "CConstExtractor"
+            Exit Sub
+        End If
+    Else
+        Dim files As Variant
+        files = Application.GetOpenFilename( _
+            "C source (*.c;*.h;*.cpp;*.hpp),*.c;*.h;*.cpp;*.hpp,All files (*.*),*.*", _
+            , "解析する C ソースを選択してください", , True)
+        If VarType(files) = vbBoolean Then
+            If files = False Then Exit Sub   ' キャンセル
+        End If
+        If IsArray(files) Then
+            Dim t As Long
+            For t = LBound(files) To UBound(files)
+                paths.Add CStr(files(t))
+            Next t
+        Else
+            paths.Add CStr(files)
+        End If
     End If
 
     Set mRecords = New Collection
     Set mMap = CreateObject("Scripting.Dictionary")   ' 大文字小文字を区別(C準拠)
 
-    ' GetOpenFilename(MultiSelect:=True) は単一でも配列を返す前提だが念のため
-    Dim arr() As String
-    If IsArray(files) Then
-        ReDim arr(LBound(files) To UBound(files))
-        Dim t As Long
-        For t = LBound(files) To UBound(files)
-            arr(t) = CStr(files(t))
-        Next t
-    Else
-        ReDim arr(0 To 0)
-        arr(0) = CStr(files)
-    End If
-
     ' 各ファイルをコメント除去して保持
     Dim texts As Collection: Set texts = New Collection
-    Dim i As Long
-    For i = LBound(arr) To UBound(arr)
+    Dim pv As Variant
+    For Each pv In paths
         Dim s As String
-        s = StripComments(ReadFile(arr(i)))
-        texts.Add Array(arr(i), s)
-    Next i
+        s = StripComments(ReadFile(CStr(pv)))
+        texts.Add Array(CStr(pv), s)
+    Next pv
 
     ' パスは依存関係があるため順序が大事:
     '   1) #define を先に全部 map へ
@@ -106,6 +120,41 @@ Public Sub ExtractCConstants()
     OutputResults
 End Sub
 
+
+' フォルダ選択ダイアログ (キャンセル時は "")
+Private Function PickFolder() As String
+    Dim fd As Object
+    Set fd = Application.FileDialog(4)   ' 4 = msoFileDialogFolderPicker
+    fd.Title = "解析する C ソースのフォルダを選択してください"
+    If fd.Show = -1 Then
+        PickFolder = fd.SelectedItems(1)
+    Else
+        PickFolder = ""
+    End If
+End Function
+
+' フォルダ配下の C ソースを再帰的に収集
+Private Function CollectFiles(folder As String) As Collection
+    Dim res As Collection: Set res = New Collection
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    If fso.FolderExists(folder) Then RecurseFolder fso, fso.GetFolder(folder), res
+    Set CollectFiles = res
+End Function
+
+Private Sub RecurseFolder(fso As Object, fld As Object, res As Collection)
+    Dim f As Object
+    For Each f In fld.Files
+        Dim ext As String: ext = LCase(fso.GetExtensionName(f.Name))
+        Select Case ext
+            Case "c", "h", "cpp", "hpp", "cc", "hh", "cxx", "hxx"
+                res.Add f.Path
+        End Select
+    Next f
+    Dim sub_ As Object
+    For Each sub_ In fld.SubFolders
+        RecurseFolder fso, sub_, res
+    Next sub_
+End Sub
 
 ' =====================================================================
 '  パース: #define
@@ -547,16 +596,64 @@ Private Sub OutputResults()
     Dim wb As Workbook: Set wb = ActiveWorkbook
     If wb Is Nothing Then Set wb = Workbooks.Add
 
-    Application.DisplayAlerts = False
-    On Error Resume Next
-    wb.Worksheets("C_Constants").Delete
-    On Error GoTo 0
-    Application.DisplayAlerts = True
+    ' ファイルを出現順に一意化 (C ファイル単位でシートを分ける)
+    Dim fileOrder As Collection: Set fileOrder = New Collection
+    Dim seenFile As Object: Set seenFile = NewDict()
+    Dim rec As Variant
+    For Each rec In mRecords
+        Dim fp As String: fp = CStr(rec(F_FILE))
+        If Not seenFile.Exists(fp) Then
+            seenFile(fp) = True
+            fileOrder.Add fp
+        End If
+    Next rec
 
-    Dim ws As Worksheet
-    Set ws = wb.Worksheets.Add
-    ws.Name = "C_Constants"
+    Dim usedNames As Object: Set usedNames = NewDict()
+    Dim total As Long: total = 0
+    Dim firstWs As Worksheet
+    Application.ScreenUpdating = False
 
+    Dim fpv As Variant
+    For Each fpv In fileOrder
+        Dim fp2 As String: fp2 = CStr(fpv)
+        Dim shName As String
+        shName = UniqueSheetName(SafeSheetName(BaseName(fp2)), usedNames)
+
+        ' 同名シートが既にあれば作り直す
+        Application.DisplayAlerts = False
+        On Error Resume Next
+        wb.Worksheets(shName).Delete
+        On Error GoTo 0
+        Application.DisplayAlerts = True
+
+        Dim ws As Worksheet
+        Set ws = wb.Worksheets.Add(After:=wb.Sheets(wb.Sheets.Count))
+        ws.Name = shName
+        If firstWs Is Nothing Then Set firstWs = ws
+
+        WriteHeader ws
+
+        Dim row As Long: row = 2
+        For Each rec In mRecords
+            If CStr(rec(F_FILE)) = fp2 Then
+                WriteRecord ws, row, rec
+                row = row + 1
+                total = total + 1
+            End If
+        Next rec
+
+        ws.Columns.AutoFit
+        ws.Rows(1).AutoFilter
+    Next fpv
+
+    Application.ScreenUpdating = True
+    If Not firstWs Is Nothing Then firstWs.Activate
+
+    MsgBox total & " 件の定数を " & fileOrder.Count & " 個のシートに抽出しました。", _
+           vbInformation, "CConstExtractor"
+End Sub
+
+Private Sub WriteHeader(ws As Worksheet)
     Dim hdr As Variant
     hdr = Array("ファイル", "行", "種別", "分類", "定数名", "値", "展開後", "評価値", "配列要素数", "参照している定数")
     Dim col As Long
@@ -564,55 +661,75 @@ Private Sub OutputResults()
         ws.Cells(1, col + 1).Value = hdr(col)
     Next col
     ws.Range(ws.Cells(1, 1), ws.Cells(1, UBound(hdr) + 1)).Font.Bold = True
-
-    Dim row As Long: row = 2
-    Dim rec As Variant
-    For Each rec In mRecords
-        Dim raw As String, brk As String, ini As String
-        raw = CStr(rec(F_RAW)): brk = CStr(rec(F_BRK)): ini = CStr(rec(F_INIT))
-
-        Dim valueDisp As String
-        If Len(brk) > 0 Then
-            valueDisp = brk
-            If Len(ini) > 0 Then valueDisp = valueDisp & " = " & Shorten(ini, 80)
-        Else
-            valueDisp = raw
-        End If
-
-        Dim resolved As String, evalS As String
-        If Len(brk) = 0 And Len(raw) > 0 Then
-            resolved = ResolveExpr(raw, NewDict())
-            evalS = TryEval(resolved)
-            If resolved = raw Then resolved = ""   ' 参照が無ければ空に
-        Else
-            resolved = "": evalS = ""
-        End If
-
-        Dim cnt As String
-        If Len(brk) > 0 Then cnt = ComputeArrayCount(brk, ini) Else cnt = ""
-
-        Dim refs As String
-        refs = BuildRefs(raw & " " & brk & " " & ini)
-
-        ws.Cells(row, 1).Value = BaseName(CStr(rec(F_FILE)))
-        ws.Cells(row, 2).Value = rec(F_LINE)
-        ws.Cells(row, 3).Value = rec(F_KIND)
-        ws.Cells(row, 4).Value = Category(CStr(rec(F_KIND)))
-        ws.Cells(row, 5).Value = rec(F_NAME)
-        ws.Cells(row, 6).Value = valueDisp
-        ws.Cells(row, 7).Value = resolved
-        ws.Cells(row, 8).Value = evalS
-        ws.Cells(row, 9).Value = cnt
-        ws.Cells(row, 10).Value = refs
-        row = row + 1
-    Next rec
-
-    ws.Columns.AutoFit
-    ws.Rows(1).AutoFilter
-    If wb.Windows.Count > 0 Then ws.Activate
-
-    MsgBox (row - 2) & " 件の定数を抽出しました。", vbInformation, "CConstExtractor"
 End Sub
+
+Private Sub WriteRecord(ws As Worksheet, row As Long, rec As Variant)
+    Dim raw As String, brk As String, ini As String
+    raw = CStr(rec(F_RAW)): brk = CStr(rec(F_BRK)): ini = CStr(rec(F_INIT))
+
+    Dim valueDisp As String
+    If Len(brk) > 0 Then
+        valueDisp = brk
+        If Len(ini) > 0 Then valueDisp = valueDisp & " = " & Shorten(ini, 80)
+    Else
+        valueDisp = raw
+    End If
+
+    Dim resolved As String, evalS As String
+    If Len(brk) = 0 And Len(raw) > 0 Then
+        resolved = ResolveExpr(raw, NewDict())
+        evalS = TryEval(resolved)
+        If resolved = raw Then resolved = ""   ' 参照が無ければ空に
+    Else
+        resolved = "": evalS = ""
+    End If
+
+    Dim cnt As String
+    If Len(brk) > 0 Then cnt = ComputeArrayCount(brk, ini) Else cnt = ""
+
+    Dim refs As String
+    refs = BuildRefs(raw & " " & brk & " " & ini)
+
+    ws.Cells(row, 1).Value = BaseName(CStr(rec(F_FILE)))
+    ws.Cells(row, 2).Value = rec(F_LINE)
+    ws.Cells(row, 3).Value = rec(F_KIND)
+    ws.Cells(row, 4).Value = Category(CStr(rec(F_KIND)))
+    ws.Cells(row, 5).Value = rec(F_NAME)
+    ws.Cells(row, 6).Value = valueDisp
+    ws.Cells(row, 7).Value = resolved
+    ws.Cells(row, 8).Value = evalS
+    ws.Cells(row, 9).Value = cnt
+    ws.Cells(row, 10).Value = refs
+End Sub
+
+' シート名に使えない文字を除去し 31 文字以内に収める
+Private Function SafeSheetName(nm As String) As String
+    Dim s As String: s = nm
+    Dim bad As Variant: bad = Array(":", "\", "/", "?", "*", "[", "]")
+    Dim i As Long
+    For i = LBound(bad) To UBound(bad)
+        s = Replace(s, CStr(bad(i)), "_")
+    Next i
+    If Len(s) > 31 Then s = Left(s, 31)
+    If Len(Trim(s)) = 0 Then s = "Sheet"
+    SafeSheetName = s
+End Function
+
+' 既に使った名前と衝突しないよう連番を付ける (31 文字制限を守る)
+Private Function UniqueSheetName(base As String, used As Object) As String
+    Dim cand As String: cand = base
+    Dim i As Long: i = 2
+    Do While used.Exists(LCase(cand))
+        Dim suf As String: suf = "_" & i
+        Dim keep As Long: keep = 31 - Len(suf)
+        If keep > Len(base) Then keep = Len(base)
+        If keep < 1 Then keep = 1
+        cand = Left(base, keep) & suf
+        i = i + 1
+    Loop
+    used(LCase(cand)) = True
+    UniqueSheetName = cand
+End Function
 
 
 ' =====================================================================
