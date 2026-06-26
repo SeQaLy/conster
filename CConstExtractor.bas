@@ -37,6 +37,13 @@ Attribute VB_Name = "CConstExtractor"
 '      定数 / 列挙体だけが  関数 / 定数名 / 種別 / ... の形で1行ずつ出力される。
 '      (関数本体に直接出現する名前が対象。未定義の関数は注記のみ)
 '
+'  --- 使い方 (関数別に変数を抽出) ---------------------------------
+'   1. 作業中シートの A 列に、調べたい関数名を縦に列挙
+'   2. その状態で ExtractFunctionVariables を実行 (定数抽出とは別機能)
+'   3. "関数別変数" シートに、各関数の 引数 / ローカル変数 が
+'      関数 / 変数名 / 区分 / 型 / 配列要素数 / 初期値 / ファイル の形で出力される。
+'      (for(int i..) のループ変数や brace 初期化子は簡易解析のため対象外)
+'
 '  --- 制限事項 -----------------------------------------------------
 '   * 関数形式マクロ  #define MAX(a,b) ...  は値を評価せず一覧化のみ。
 '   * 1行に複数の const を「;」で区切った書き方は最初の文のみ対象。
@@ -57,6 +64,8 @@ Private Const F_INIT As Long = 6    ' 配列の初期化子 (例 "{1,2,3}")
 Private mRecords As Collection      ' 各要素は Variant 配列(0..6)
 Private mMap As Object              ' 定数名 -> スカラ生テキスト
 Private mFuncBodies As Object       ' 関数名 -> 関数本体テキスト
+Private mFuncParams As Object       ' 関数名 -> 引数リストテキスト
+Private mFuncFile As Object         ' 関数名 -> 定義ファイル(ベース名)
 Private mBase As String             ' 現在処理中ファイルのベース名
 
 ' --- 評価器の作業用状態 -------------------------------------------
@@ -239,6 +248,226 @@ Public Sub ExtractByFunction()
            vbInformation, "CConstExtractor"
 End Sub
 
+' 作業中シートの A 列に並んだ関数名について、その関数で使用している
+' 変数(引数・ローカル変数)を抽出して新しいシートに一覧出力する。
+'   - A 列 : 調べたい関数名 (1行1名)
+'   - 出力 : "関数別変数" シートに 関数 / 変数名 / 区分 / 型 / 配列要素数 / 初期値 / ファイル
+'  ※ 定数・列挙体の抽出 (ExtractByFunction) とは別機能。
+Public Sub ExtractFunctionVariables()
+    Dim wsIn As Worksheet: Set wsIn = ActiveSheet
+    If wsIn Is Nothing Then Exit Sub
+
+    If Not EnsureData() Then Exit Sub
+    If mFuncBodies Is Nothing Then
+        MsgBox "関数情報がありません。一度 ExtractCConstants を実行してください。", _
+               vbExclamation, "CConstExtractor"
+        Exit Sub
+    End If
+
+    ' A 列から関数名を集める (出現順・重複排除)
+    Dim lastRow As Long
+    lastRow = wsIn.Cells(wsIn.Rows.Count, 1).End(-4162).Row   ' xlUp
+    Dim funcs As Collection: Set funcs = New Collection
+    Dim seen As Object: Set seen = NewDict()
+    Dim r As Long
+    For r = 1 To lastRow
+        Dim k As String: k = FirstIdent(Trim(CStr(wsIn.Cells(r, 1).Value)))
+        If Len(k) > 0 And k <> "関数名" And k <> "定数名" And Not seen.Exists(k) Then
+            seen(k) = True
+            funcs.Add k
+        End If
+    Next r
+    If funcs.Count = 0 Then
+        MsgBox "A 列に関数名がありません。", vbExclamation, "CConstExtractor"
+        Exit Sub
+    End If
+
+    Dim wb As Workbook: Set wb = wsIn.Parent
+    Dim ws As Worksheet: Set ws = FreshSheet(wb, "関数別変数")
+
+    Dim hdr As Variant
+    hdr = Array("関数", "変数名", "区分", "型", "配列要素数", "初期値", "ファイル")
+    Dim col As Long
+    For col = 0 To UBound(hdr)
+        ws.Cells(1, col + 1).Value = hdr(col)
+    Next col
+    ws.Range(ws.Cells(1, 1), ws.Cells(1, UBound(hdr) + 1)).Font.Bold = True
+
+    Application.ScreenUpdating = False
+    Dim row As Long: row = 2
+    Dim totalVars As Long
+
+    Dim fn As Variant
+    For Each fn In funcs
+        Dim fname As String: fname = CStr(fn)
+        If Not mFuncBodies.Exists(fname) Then
+            ws.Cells(row, 1).Value = fname
+            ws.Cells(row, 2).Value = "(関数定義が見つかりません)"
+            row = row + 1
+        Else
+            Dim vars As Collection: Set vars = CollectFuncVars(fname)
+            If vars.Count = 0 Then
+                ws.Cells(row, 1).Value = fname
+                ws.Cells(row, 2).Value = "(変数なし)"
+                row = row + 1
+            Else
+                Dim v As Variant
+                For Each v In vars
+                    ' v = Array(name, kind, type, brk, init)
+                    ws.Cells(row, 1).Value = fname
+                    ws.Cells(row, 2).Value = v(0)
+                    ws.Cells(row, 3).Value = v(1)
+                    ws.Cells(row, 4).Value = v(2)
+                    ws.Cells(row, 5).Value = IIf(Len(CStr(v(3))) > 0, ComputeArrayCount(CStr(v(3)), CStr(v(4))), "")
+                    ws.Cells(row, 6).Value = v(4)
+                    ws.Cells(row, 7).Value = mFuncFile(fname)
+                    row = row + 1
+                    totalVars = totalVars + 1
+                Next v
+            End If
+        End If
+    Next fn
+
+    ws.Columns.AutoFit
+    ws.Rows(1).AutoFilter
+    ws.Activate
+    Application.ScreenUpdating = True
+
+    MsgBox funcs.Count & " 個の関数について、延べ " & totalVars & " 件の変数を抽出しました。", _
+           vbInformation, "CConstExtractor"
+End Sub
+
+' 1 関数の 引数 + ローカル変数 を集める (名前で重複排除、引数優先)
+Private Function CollectFuncVars(fname As String) As Collection
+    Dim res As Collection: Set res = New Collection
+    Dim seen As Object: Set seen = NewDict()
+
+    ' 引数
+    If mFuncParams.Exists(fname) Then
+        Dim plist As Collection: Set plist = SplitTopLevel(CStr(mFuncParams(fname)), ",")
+        Dim p As Variant
+        For Each p In plist
+            Dim pt As String: pt = Trim(CStr(p))
+            If Len(pt) > 0 And LCase(pt) <> "void" Then
+                Dim pn As String, ptp As String, pb As String, pi As String
+                ParseVar pt, pn, ptp, pb, pi
+                If Len(pn) > 0 And Not seen.Exists(pn) Then
+                    seen(pn) = True
+                    res.Add Array(pn, "引数", ptp, pb, pi)
+                End If
+            End If
+        Next p
+    End If
+
+    ' ローカル変数: 本体のリテラルを除去し、{ } を ; に置換して文単位に分割
+    Dim body As String: body = StripLiterals(CStr(mFuncBodies(fname)))
+    body = Replace(Replace(body, "{", ";"), "}", ";")
+    Dim stmts As Collection: Set stmts = SplitTopLevel(body, ";")
+    Dim st As Variant
+    For Each st In stmts
+        Dim decls As Collection: Set decls = ParseLocalDecl(CStr(st))
+        Dim d As Variant
+        For Each d In decls
+            ' d = Array(name, type, brk, init)
+            Dim dn As String: dn = CStr(d(0))
+            If Len(dn) > 0 And Not seen.Exists(dn) Then
+                seen(dn) = True
+                res.Add Array(dn, "ローカル", d(1), d(2), d(3))
+            End If
+        Next d
+    Next st
+
+    Set CollectFuncVars = res
+End Function
+
+' 1 文がローカル変数宣言なら、その宣言子ごとに Array(name,type,brk,init) を返す
+Private Function ParseLocalDecl(stmt As String) As Collection
+    Dim res As Collection: Set res = New Collection
+    Dim s As String: s = Trim(stmt)
+    If Len(s) = 0 Then Set ParseLocalDecl = res: Exit Function
+    If Not IsDeclStmt(s) Then Set ParseLocalDecl = res: Exit Function
+
+    Dim decls As Collection: Set decls = SplitTopLevel(s, ",")
+    Dim baseType As String: baseType = ""
+    Dim i As Long: i = 0
+    Dim d As Variant
+    For Each d In decls
+        Dim nm As String, typ As String, brk As String, ini As String
+        ParseVar CStr(d), nm, typ, brk, ini
+        If Len(nm) > 0 Then
+            If i = 0 Then
+                baseType = Trim(Replace(typ, "*", ""))   ' 2個目以降に継承する基本型
+            ElseIf Len(typ) = 0 Then
+                typ = baseType
+            End If
+            res.Add Array(nm, typ, brk, ini)
+        End If
+        i = i + 1
+    Next d
+    Set ParseLocalDecl = res
+End Function
+
+' 宣言子 "const char *buf[2]" 等から 名前/型/括弧部/初期化子 を取り出す
+Private Sub ParseVar(decl As String, ByRef vName As String, ByRef vType As String, _
+                     ByRef vBrk As String, ByRef vInit As String)
+    vName = "": vType = "": vBrk = "": vInit = ""
+    Dim leftPart As String
+    Dim eq As Long: eq = TopLevelEq(decl)
+    If eq > 0 Then
+        leftPart = Trim(Left(decl, eq - 1))
+        vInit = Trim(Mid(decl, eq + 1))
+    Else
+        leftPart = Trim(decl)
+    End If
+    If InStr(leftPart, "(") > 0 Then Exit Sub   ' 関数ポインタ等は対象外
+
+    Dim reB As Object: Set reB = NewRegex("\[[^\]]*\]")
+    Dim mb As Object
+    For Each mb In reB.Execute(leftPart)
+        vBrk = vBrk & mb.Value
+    Next mb
+    Dim namePart As String: namePart = reB.Replace(leftPart, " ")
+
+    Dim reId As Object: Set reId = NewRegex("[A-Za-z_]\w*")
+    Dim mm As Object, lastPos As Long, found As Boolean
+    For Each mm In reId.Execute(namePart)
+        vName = mm.Value: lastPos = mm.FirstIndex: found = True
+    Next mm
+    If Not found Then vName = "": Exit Sub
+    vType = Trim(Left(namePart, lastPos))   ' 末尾の変数名より前を型とする
+End Sub
+
+' 文がローカル変数宣言らしいか (型 + 変数名 の形)
+'  宣言子プレフィックス(先頭から = ; ( [ . , 演算子 などの手前まで)に
+'  識別子が 2 個以上 (型 + 名前) あれば宣言とみなす。
+Private Function IsDeclStmt(stmt As String) As Boolean
+    IsDeclStmt = False
+    Dim first As String: first = FirstIdent(stmt)
+    If Len(first) = 0 Then Exit Function
+    Select Case first
+        Case "return", "if", "else", "while", "for", "switch", "case", _
+             "default", "do", "goto", "break", "continue", "sizeof", "typedef"
+            Exit Function
+    End Select
+
+    Dim n As Long: n = Len(stmt)
+    Dim i As Long: i = 1
+    Dim idents As Long: idents = 0
+    Dim inWord As Boolean: inWord = False
+    Do While i <= n
+        Dim c As String: c = Mid(stmt, i, 1)
+        If IsIdentCh(c) Then
+            If Not inWord Then idents = idents + 1: inWord = True
+        ElseIf c = " " Or c = vbTab Or c = vbCr Or c = vbLf Or c = "*" Then
+            inWord = False
+        Else
+            Exit Do   ' = ; ( [ . -> , 演算子 などで宣言子プレフィックス終わり
+        End If
+        i = i + 1
+    Loop
+    IsDeclStmt = (idents >= 2)
+End Function
+
 ' 解析データ(mRecords)が無ければ読み込む。中断時 False。
 Private Function EnsureData() As Boolean
     If mRecords Is Nothing Then
@@ -336,6 +565,8 @@ Private Function LoadSources() As Boolean
     Set mRecords = New Collection
     Set mMap = CreateObject("Scripting.Dictionary")   ' 大文字小文字を区別(C準拠)
     Set mFuncBodies = CreateObject("Scripting.Dictionary")
+    Set mFuncParams = CreateObject("Scripting.Dictionary")
+    Set mFuncFile = CreateObject("Scripting.Dictionary")
 
     ' 各ファイルをコメント除去して保持
     Dim texts As Collection: Set texts = New Collection
@@ -536,7 +767,7 @@ End Sub
 Private Sub ParseFunctions(s As String, fileName As String)
     ' 関数ヘッダ  name(...) {  を検出。引数内の () は許容、; { } は不可。
     Dim re As Object
-    Set re = NewRegex("([A-Za-z_]\w*)[ \t\r\n]*\([^;{}]*\)[ \t\r\n]*\{")
+    Set re = NewRegex("([A-Za-z_]\w*)[ \t\r\n]*\(([^;{}]*)\)[ \t\r\n]*\{")
     Dim m As Object
     For Each m In re.Execute(s)
         Dim nm As String: nm = m.SubMatches(0)
@@ -549,6 +780,8 @@ Private Sub ParseFunctions(s As String, fileName As String)
                     mFuncBodies(nm) = mFuncBodies(nm) & vbLf & body
                 Else
                     mFuncBodies.Add nm, body
+                    mFuncParams.Add nm, m.SubMatches(1)
+                    mFuncFile.Add nm, BaseName(fileName)
                 End If
             End If
         End If
