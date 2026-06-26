@@ -30,3 +30,22 @@ const int primes[] = { 2, 3, 5, 7, 11 };   /* 初期化子から 5 */
 const char name[] = "abcd";                /* 4 + NUL = 5 */
 const double PI = 3.14159;
 static const int OFFSET = HEADER_SIZE + 1;
+
+/* 関数別抽出 (ExtractByFunction) の動作確認用 */
+int init_buffer(int mode)
+{
+    char buf[BUF_SIZE];          /* BUF_SIZE を使用 */
+    int flags = FLAG_ALL;        /* FLAG_ALL を使用 */
+    if (mode == BLUE) {          /* enum BLUE を使用 */
+        flags = FLAG_A;          /* FLAG_A を使用 */
+    }
+    return flags & HEX_MASK;     /* HEX_MASK を使用 */
+}
+
+void draw(void)
+{
+    int color = WHITE;           /* enum WHITE を使用 */
+    int limit = MAX_LINE;        /* MAX_LINE を使用 */
+    (void)color;
+    (void)limit;
+}

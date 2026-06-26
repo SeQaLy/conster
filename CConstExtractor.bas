@@ -30,6 +30,13 @@ Attribute VB_Name = "CConstExtractor"
 '        種別 / 分類 / 値 / 展開後 / 評価値 / 配列要素数 / 参照 / ファイル / 行
 '      が書き込まれる。未定義の名前は B 列に "(該当なし)"。
 '
+'  --- 使い方 (関数別に抽出) ---------------------------------------
+'   1. 作業中シートの A 列に、調べたい関数名を縦に列挙
+'   2. その状態で ExtractByFunction を実行
+'   3. "関数別抽出" シートに、各関数の本体で使われている
+'      定数 / 列挙体だけが  関数 / 定数名 / 種別 / ... の形で1行ずつ出力される。
+'      (関数本体に直接出現する名前が対象。未定義の関数は注記のみ)
+'
 '  --- 制限事項 -----------------------------------------------------
 '   * 関数形式マクロ  #define MAX(a,b) ...  は値を評価せず一覧化のみ。
 '   * 1行に複数の const を「;」で区切った書き方は最初の文のみ対象。
@@ -49,6 +56,7 @@ Private Const F_INIT As Long = 6    ' 配列の初期化子 (例 "{1,2,3}")
 
 Private mRecords As Collection      ' 各要素は Variant 配列(0..6)
 Private mMap As Object              ' 定数名 -> スカラ生テキスト
+Private mFuncBodies As Object       ' 関数名 -> 関数本体テキスト
 Private mBase As String             ' 現在処理中ファイルのベース名
 
 ' --- 評価器の作業用状態 -------------------------------------------
@@ -77,21 +85,10 @@ Public Sub LookupConstants()
     If ws Is Nothing Then Exit Sub
 
     ' 解析データが無ければ読み込む
-    If mRecords Is Nothing Then
-        If Not LoadSources() Then Exit Sub
-    ElseIf mRecords.Count = 0 Then
-        If Not LoadSources() Then Exit Sub
-    End If
+    If Not EnsureData() Then Exit Sub
 
     ' 定数名 -> レコード の索引を作る (重複名は最初の定義を優先)
-    Dim idx As Object: Set idx = NewDict()
-    Dim rec As Variant
-    For Each rec In mRecords
-        Dim nm As String: nm = CStr(rec(F_NAME))
-        If Len(nm) > 0 Then
-            If Not idx.Exists(nm) Then idx.Add nm, rec
-        End If
-    Next rec
+    Dim idx As Object: Set idx = BuildIndex()
 
     ' A 列の最終行
     Dim lastRow As Long
@@ -139,6 +136,145 @@ Public Sub LookupConstants()
     MsgBox "検索完了: ヒット " & foundN & " 件 / 該当なし " & missN & " 件", _
            vbInformation, "CConstExtractor"
 End Sub
+
+' 作業中シートの A 列に並んだ関数名について、その関数本体で使われている
+' 定数 / 列挙体だけを抽出して新しいシートに一覧出力する。
+'   - A 列 : 調べたい関数名 (1行1名)
+'   - 出力 : "関数別抽出" シートに  関数 / 定数名 / 種別 / ... を1行ずつ
+Public Sub ExtractByFunction()
+    Dim wsIn As Worksheet: Set wsIn = ActiveSheet
+    If wsIn Is Nothing Then Exit Sub
+
+    If Not EnsureData() Then Exit Sub
+    If mFuncBodies Is Nothing Then
+        MsgBox "関数情報がありません。一度 ExtractCConstants を実行してください。", _
+               vbExclamation, "CConstExtractor"
+        Exit Sub
+    End If
+    Dim idx As Object: Set idx = BuildIndex()
+
+    ' A 列から関数名を集める (出現順・重複排除)
+    Dim lastRow As Long
+    lastRow = wsIn.Cells(wsIn.Rows.Count, 1).End(-4162).Row   ' xlUp
+    Dim funcs As Collection: Set funcs = New Collection
+    Dim seen As Object: Set seen = NewDict()
+    Dim r As Long
+    For r = 1 To lastRow
+        Dim k As String: k = FirstIdent(Trim(CStr(wsIn.Cells(r, 1).Value)))
+        If Len(k) > 0 And k <> "関数名" And k <> "定数名" And Not seen.Exists(k) Then
+            seen(k) = True
+            funcs.Add k
+        End If
+    Next r
+    If funcs.Count = 0 Then
+        MsgBox "A 列に関数名がありません。", vbExclamation, "CConstExtractor"
+        Exit Sub
+    End If
+
+    ' 出力シート
+    Dim wb As Workbook: Set wb = wsIn.Parent
+    Dim ws As Worksheet: Set ws = FreshSheet(wb, "関数別抽出")
+
+    Dim hdr As Variant
+    hdr = Array("関数", "定数名", "種別", "分類", "値", "展開後", "評価値", "配列要素数", "参照している定数", "ファイル", "行")
+    Dim col As Long
+    For col = 0 To UBound(hdr)
+        ws.Cells(1, col + 1).Value = hdr(col)
+    Next col
+    ws.Range(ws.Cells(1, 1), ws.Cells(1, UBound(hdr) + 1)).Font.Bold = True
+
+    Application.ScreenUpdating = False
+    Dim row As Long: row = 2
+    Dim totalHits As Long
+    Dim reId As Object: Set reId = NewRegex("[A-Za-z_]\w*")
+
+    Dim fn As Variant
+    For Each fn In funcs
+        Dim fname As String: fname = CStr(fn)
+        If Not mFuncBodies.Exists(fname) Then
+            ws.Cells(row, 1).Value = fname
+            ws.Cells(row, 2).Value = "(関数定義が見つかりません)"
+            row = row + 1
+        Else
+            ' 本体から文字列/文字リテラルを除いて識別子を走査
+            Dim body As String: body = StripLiterals(CStr(mFuncBodies(fname)))
+            Dim used As Object: Set used = NewDict()
+            Dim mm As Object
+            Dim hit As Long: hit = 0
+            For Each mm In reId.Execute(body)
+                Dim id As String: id = mm.Value
+                If idx.Exists(id) And Not used.Exists(id) Then
+                    used.Add id, True
+                    Dim ff As Variant: ff = ComputeFields(idx(id))
+                    ws.Cells(row, 1).Value = fname
+                    ws.Cells(row, 2).Value = ff(4)     ' 定数名
+                    ws.Cells(row, 3).Value = ff(2)     ' 種別
+                    ws.Cells(row, 4).Value = ff(3)     ' 分類
+                    ws.Cells(row, 5).Value = ff(5)     ' 値
+                    ws.Cells(row, 6).Value = ff(6)     ' 展開後
+                    ws.Cells(row, 7).Value = ff(7)     ' 評価値
+                    ws.Cells(row, 8).Value = ff(8)     ' 配列要素数
+                    ws.Cells(row, 9).Value = ff(9)     ' 参照している定数
+                    ws.Cells(row, 10).Value = ff(0)    ' ファイル
+                    ws.Cells(row, 11).Value = ff(1)    ' 行
+                    row = row + 1
+                    hit = hit + 1
+                End If
+            Next mm
+            If hit = 0 Then
+                ws.Cells(row, 1).Value = fname
+                ws.Cells(row, 2).Value = "(使用している定数なし)"
+                row = row + 1
+            End If
+            totalHits = totalHits + hit
+        End If
+    Next fn
+
+    ws.Columns.AutoFit
+    ws.Rows(1).AutoFilter
+    ws.Activate
+    Application.ScreenUpdating = True
+
+    MsgBox funcs.Count & " 個の関数について、延べ " & totalHits & " 件の定数使用を抽出しました。", _
+           vbInformation, "CConstExtractor"
+End Sub
+
+' 解析データ(mRecords)が無ければ読み込む。中断時 False。
+Private Function EnsureData() As Boolean
+    If mRecords Is Nothing Then
+        EnsureData = LoadSources()
+    ElseIf mRecords.Count = 0 Then
+        EnsureData = LoadSources()
+    Else
+        EnsureData = True
+    End If
+End Function
+
+' 定数名 -> レコード の索引 (重複名は最初の定義を優先)
+Private Function BuildIndex() As Object
+    Dim idx As Object: Set idx = NewDict()
+    Dim rec As Variant
+    For Each rec In mRecords
+        Dim nm As String: nm = CStr(rec(F_NAME))
+        If Len(nm) > 0 Then
+            If Not idx.Exists(nm) Then idx.Add nm, rec
+        End If
+    Next rec
+    Set BuildIndex = idx
+End Function
+
+' 既存の同名シートを消して新規シートを末尾に作る
+Private Function FreshSheet(wb As Workbook, nm As String) As Worksheet
+    Application.DisplayAlerts = False
+    On Error Resume Next
+    wb.Worksheets(nm).Delete
+    On Error GoTo 0
+    Application.DisplayAlerts = True
+    Dim ws As Worksheet
+    Set ws = wb.Worksheets.Add(After:=wb.Sheets(wb.Sheets.Count))
+    ws.Name = nm
+    Set FreshSheet = ws
+End Function
 
 ' ルックアップ結果の見出しを 1 行目に用意する。
 ' 既に A1 が見出し("定数名") ならその行へ、そうでなければ 1 行挿入して付ける。
@@ -199,6 +335,7 @@ Private Function LoadSources() As Boolean
 
     Set mRecords = New Collection
     Set mMap = CreateObject("Scripting.Dictionary")   ' 大文字小文字を区別(C準拠)
+    Set mFuncBodies = CreateObject("Scripting.Dictionary")
 
     ' 各ファイルをコメント除去して保持
     Dim texts As Collection: Set texts = New Collection
@@ -222,6 +359,9 @@ Private Function LoadSources() As Boolean
     Next it
     For Each it In texts
         ParseConsts CStr(it(1)), CStr(it(0))
+    Next it
+    For Each it In texts
+        ParseFunctions CStr(it(1)), CStr(it(0))
     Next it
 
     LoadSources = True
@@ -389,6 +529,114 @@ Private Sub ParseDeclarator(decl As String, ByRef vName As String, ByRef vBrk As
     Next mm
 End Sub
 
+
+' =====================================================================
+'  パース: 関数定義 (関数名 -> 本体テキスト)
+' =====================================================================
+Private Sub ParseFunctions(s As String, fileName As String)
+    ' 関数ヘッダ  name(...) {  を検出。引数内の () は許容、; { } は不可。
+    Dim re As Object
+    Set re = NewRegex("([A-Za-z_]\w*)[ \t\r\n]*\([^;{}]*\)[ \t\r\n]*\{")
+    Dim m As Object
+    For Each m In re.Execute(s)
+        Dim nm As String: nm = m.SubMatches(0)
+        If Not IsCtrlKeyword(nm) Then
+            ' 直前が '#'(マクロ定義) の行は除外
+            If Not OnDirectiveLine(s, m.FirstIndex) Then
+                ' m の末尾が '{' なので、その直後(0-based)から本体を取り出す
+                Dim body As String: body = ExtractBlock(s, m.FirstIndex + m.Length)
+                If mFuncBodies.Exists(nm) Then
+                    mFuncBodies(nm) = mFuncBodies(nm) & vbLf & body
+                Else
+                    mFuncBodies.Add nm, body
+                End If
+            End If
+        End If
+    Next m
+End Sub
+
+' 開き '{' の直後(afterBrace は 0-based 位置)から、対応する '}' の手前までを返す
+Private Function ExtractBlock(s As String, afterBrace As Long) As String
+    Dim depth As Long: depth = 1
+    Dim n As Long: n = Len(s)
+    Dim startPos As Long: startPos = afterBrace + 1   ' 1-based
+    Dim i As Long: i = startPos
+    Dim inS As Boolean, inC As Boolean
+    Do While i <= n And depth > 0
+        Dim c As String: c = Mid(s, i, 1)
+        If inS Then
+            If c = "\" Then
+                i = i + 1
+            ElseIf c = """" Then
+                inS = False
+            End If
+        ElseIf inC Then
+            If c = "\" Then
+                i = i + 1
+            ElseIf c = "'" Then
+                inC = False
+            End If
+        Else
+            If c = """" Then
+                inS = True
+            ElseIf c = "'" Then
+                inC = True
+            ElseIf c = "{" Then
+                depth = depth + 1
+            ElseIf c = "}" Then
+                depth = depth - 1
+            End If
+        End If
+        i = i + 1
+    Loop
+    ' ループ終了時 i は閉じ '}' の次。本体は startPos .. (i-2)
+    Dim bodyLen As Long: bodyLen = (i - 1) - startPos
+    If bodyLen < 0 Then bodyLen = 0
+    ExtractBlock = Mid(s, startPos, bodyLen)
+End Function
+
+' 制御構文など、関数ではないキーワードか
+Private Function IsCtrlKeyword(nm As String) As Boolean
+    Select Case nm
+        Case "if", "for", "while", "switch", "do", "else", "return", _
+             "sizeof", "case", "default", "goto"
+            IsCtrlKeyword = True
+        Case Else
+            IsCtrlKeyword = False
+    End Select
+End Function
+
+' firstIndex(0-based) の位置が、行頭が '#' のプリプロセッサ行かどうか
+Private Function OnDirectiveLine(s As String, firstIndex As Long) As Boolean
+    Dim p As Long: p = firstIndex   ' 1-based の直前位置にもなる
+    ' 行頭まで戻る
+    Do While p > 0
+        Dim c As String: c = Mid(s, p, 1)
+        If c = vbLf Or c = vbCr Then Exit Do
+        p = p - 1
+    Loop
+    ' 行頭の空白を読み飛ばして最初の非空白が '#' か
+    Dim q As Long: q = p + 1
+    Do While q <= Len(s)
+        Dim d As String: d = Mid(s, q, 1)
+        If d = " " Or d = vbTab Then
+            q = q + 1
+        Else
+            Exit Do
+        End If
+    Loop
+    OnDirectiveLine = (Mid(s, q, 1) = "#")
+End Function
+
+' 文字列/文字リテラルの中身を空白化して、識別子走査の誤検出を防ぐ
+Private Function StripLiterals(s As String) As String
+    Dim re1 As Object: Set re1 = NewRegex("""(\\.|[^""\\])*""")
+    Dim re2 As Object: Set re2 = NewRegex("'(\\.|[^'\\])*'")
+    Dim t As String
+    t = re1.Replace(s, " ")
+    t = re2.Replace(t, " ")
+    StripLiterals = t
+End Function
 
 ' =====================================================================
 '  値の展開 (別定数を再帰的に置換)
