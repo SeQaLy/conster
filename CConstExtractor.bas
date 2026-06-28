@@ -40,8 +40,12 @@ Attribute VB_Name = "CConstExtractor"
 '  --- 使い方 (関数別に変数を抽出) ---------------------------------
 '   1. 作業中シートの A 列に、調べたい関数名を縦に列挙
 '   2. その状態で ExtractFunctionVariables を実行 (定数抽出とは別機能)
-'   3. "関数別変数" シートに、各関数の 引数 / ローカル変数 が
+'   3. "関数別変数" シートに、各関数の 引数 / ローカル変数 と、
+'      本体で参照している グローバル変数 が
 '      関数 / 変数名 / 区分 / 型 / 配列要素数 / 初期値 / ファイル の形で出力される。
+'        区分 = 引数 / ローカル / グローバル
+'        (グローバルは「本体で実際に使っているもの」のみ。同名のローカル/引数が
+'         あればシャドウとみなしグローバルは出さない)
 '      (for(int i..) のループ変数や brace 初期化子は簡易解析のため対象外)
 '
 '  --- 制限事項 -----------------------------------------------------
@@ -66,6 +70,7 @@ Private mMap As Object              ' 定数名 -> スカラ生テキスト
 Private mFuncBodies As Object       ' 関数名 -> 関数本体テキスト
 Private mFuncParams As Object       ' 関数名 -> 引数リストテキスト
 Private mFuncFile As Object         ' 関数名 -> 定義ファイル(ベース名)
+Private mGlobals As Object          ' グローバル変数名 -> Array(型,括弧部,初期値,ファイル)
 Private mBase As String             ' 現在処理中ファイルのベース名
 
 ' --- 評価器の作業用状態 -------------------------------------------
@@ -377,6 +382,20 @@ Private Function CollectFuncVars(fname As String) As Collection
         Next d
     Next st
 
+    ' グローバル変数: 本体で参照しているもの (ローカル/引数で同名なら除外=シャドウ)
+    If Not mGlobals Is Nothing Then
+        Dim reId As Object: Set reId = NewRegex("[A-Za-z_]\w*")
+        Dim mm As Object
+        For Each mm In reId.Execute(body)
+            Dim gid As String: gid = mm.Value
+            If mGlobals.Exists(gid) And Not seen.Exists(gid) Then
+                seen(gid) = True
+                Dim g As Variant: g = mGlobals(gid)
+                res.Add Array(gid, "グローバル", g(0), g(1), g(2))
+            End If
+        Next mm
+    End If
+
     Set CollectFuncVars = res
 End Function
 
@@ -436,6 +455,105 @@ Private Sub ParseVar(decl As String, ByRef vName As String, ByRef vType As Strin
     If Not found Then vName = "": Exit Sub
     vType = Trim(Left(namePart, lastPos))   ' 末尾の変数名より前を型とする
 End Sub
+
+' =====================================================================
+'  パース: グローバル変数 (ファイルスコープの非 const 変数定義)
+' =====================================================================
+' 関数本体・struct/enum 本体(波括弧の中)はスキップし、ファイルスコープの
+' 文だけを取り出して変数宣言を拾う。const は定数として別管理なので除外。
+Private Sub ParseGlobals(s As String, fileName As String)
+    Dim n As Long: n = Len(s)
+    Dim i As Long: i = 1
+    Dim depth As Long: depth = 0
+    Dim topKind As String   ' "", "init"(初期化子), "discard"(関数/型の本体)
+    Dim buf As String
+    Dim inS As Boolean, inC As Boolean
+    Dim fb As String: fb = BaseName(fileName)
+
+    Do While i <= n
+        Dim c As String: c = Mid(s, i, 1)
+        Dim collecting As Boolean: collecting = (depth = 0 Or topKind = "init")
+        If inS Then
+            ' 文字列はどの深さでもスキップ(波括弧の誤カウント防止)。収集中のみ buf へ。
+            If c = "\" Then
+                If collecting Then buf = buf & c & Mid(s, i + 1, 1)
+                i = i + 1
+            ElseIf c = """" Then
+                If collecting Then buf = buf & c
+                inS = False
+            Else
+                If collecting Then buf = buf & c
+            End If
+        ElseIf inC Then
+            If c = "\" Then
+                i = i + 1
+            ElseIf c = "'" Then
+                inC = False
+            End If
+        Else
+            If c = """" Then
+                inS = True
+                If collecting Then buf = buf & c
+            ElseIf c = "'" Then
+                inC = True
+            ElseIf c = "{" Then
+                If depth = 0 Then
+                    If RTrimLastChar(buf) = "=" Then
+                        topKind = "init": buf = buf & c
+                    Else
+                        topKind = "discard"
+                    End If
+                ElseIf topKind = "init" Then
+                    buf = buf & c
+                End If
+                depth = depth + 1
+            ElseIf c = "}" Then
+                depth = depth - 1
+                If depth = 0 Then
+                    If topKind = "init" Then
+                        buf = buf & c
+                    Else
+                        buf = ""        ' 関数/型のヘッダを破棄
+                    End If
+                    topKind = ""
+                ElseIf topKind = "init" Then
+                    buf = buf & c
+                End If
+            ElseIf depth = 0 Then
+                If c = ";" Then
+                    ProcessGlobalStmt buf, fb
+                    buf = ""
+                Else
+                    buf = buf & c
+                End If
+            ElseIf topKind = "init" Then
+                buf = buf & c
+            End If
+        End If
+        i = i + 1
+    Loop
+End Sub
+
+' ファイルスコープの 1 文を変数宣言として解釈し、非 const なら mGlobals へ
+Private Sub ProcessGlobalStmt(stmt As String, fb As String)
+    Dim decls As Collection: Set decls = ParseLocalDecl(stmt)
+    Dim d As Variant
+    For Each d In decls
+        Dim nm As String: nm = CStr(d(0))
+        Dim typ As String: typ = CStr(d(1))
+        If Len(nm) > 0 And InStr(typ, "const") = 0 Then
+            If Not mGlobals.Exists(nm) Then
+                mGlobals.Add nm, Array(typ, CStr(d(2)), CStr(d(3)), fb)
+            End If
+        End If
+    Next d
+End Sub
+
+' 末尾の空白を除いた最後の 1 文字 (無ければ "")
+Private Function RTrimLastChar(s As String) As String
+    Dim t As String: t = RTrim(s)
+    If Len(t) = 0 Then RTrimLastChar = "" Else RTrimLastChar = Right(t, 1)
+End Function
 
 ' 文がローカル変数宣言らしいか (型 + 変数名 の形)
 '  宣言子プレフィックス(先頭から = ; ( [ . , 演算子 などの手前まで)に
@@ -567,6 +685,7 @@ Private Function LoadSources() As Boolean
     Set mFuncBodies = CreateObject("Scripting.Dictionary")
     Set mFuncParams = CreateObject("Scripting.Dictionary")
     Set mFuncFile = CreateObject("Scripting.Dictionary")
+    Set mGlobals = CreateObject("Scripting.Dictionary")
 
     ' 各ファイルをコメント除去して保持
     Dim texts As Collection: Set texts = New Collection
@@ -593,6 +712,9 @@ Private Function LoadSources() As Boolean
     Next it
     For Each it In texts
         ParseFunctions CStr(it(1)), CStr(it(0))
+    Next it
+    For Each it In texts
+        ParseGlobals CStr(it(1)), CStr(it(0))
     Next it
 
     LoadSources = True
