@@ -4,3 +4,8 @@
 # OS / エディタの一時物
 Thumbs.db
 *.tmp
+
+# リポジトリ管理対象外のファイル
+Conster.xlsm
+Conster.xlsx
+test.c
